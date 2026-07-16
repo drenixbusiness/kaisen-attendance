@@ -1,0 +1,19 @@
+{
+  "name": "drenix-attendance-bot",
+  "version": "2.1.0",
+  "description": "Hikvision -> Telegram + Google Sheets davomat boti (Drenix)",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^144.0.0",
+    "multer": "^2.0.1",
+    "telegraf": "^4.16.3"
+  }
+}
