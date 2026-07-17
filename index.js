@@ -738,6 +738,18 @@ app.post(cfg.EVENT_PATH, upload.any(), onHttpPush);
 app.post("*", upload.any(), onHttpPush);
 app.get("*", (req, res) => res.send(`${cfg.COMPANY_NAME} Attendance Bot is running ✅`));
 
+// Devices sometimes abort a push mid-upload — that's harmless noise, not an
+// error worth logging a stack trace for.
+app.use((err, req, res, next) => {
+  const msg = String((err && err.message) || "");
+  if (msg.includes("Request aborted") || msg.includes("ECONNABORTED") || msg.includes("aborted")) {
+    if (!res.headersSent) res.status(400).end();
+    return;
+  }
+  console.error("HTTP listener error:", msg);
+  if (!res.headersSent) res.status(500).end();
+});
+
 // ============================= ALERTSTREAM (primary path) =============================
 
 const ALL_DEVICE_IPS = [...new Set([...cfg.INSIDE_IPS, ...cfg.OUTSIDE_IPS])];
