@@ -175,9 +175,43 @@ function agentFor(ip, port) {
  * One-shot HTTP request with Digest auth that returns parsed JSON.
  * Used by the poller for /ISAPI/System/time and /ISAPI/AccessControl/AcsEvent.
  */
+// Digest auth cache: Hikvision accepts nonce reuse with an incremented nc,
+// so after the first 401 challenge every following request needs just ONE
+// round-trip instead of two — halves device load and shaves latency.
+const authCache = new Map(); // `${ip}:${port}` -> { realm, nonce, opaque, qop, nc }
+
+function cacheChallenge(key, www) {
+  const pick = (k) => {
+    const m = www.match(new RegExp(`${k}="([^"]+)"`)) || www.match(new RegExp(`${k}=([^,\\s]+)`));
+    return m ? m[1] : null;
+  };
+  let qop = pick("qop");
+  if (qop && qop.includes(",")) qop = qop.split(",")[0].trim();
+  authCache.set(key, { realm: pick("realm") || "", nonce: pick("nonce") || "", opaque: pick("opaque"), qop, nc: 0 });
+}
+
+function headerFromCache(key, user, pass, method, uri) {
+  const c = authCache.get(key);
+  if (!c) return null;
+  c.nc += 1;
+  const nc = String(c.nc).padStart(8, "0");
+  const cnonce = crypto.randomBytes(8).toString("hex");
+  const ha1 = md5(`${user}:${c.realm}:${pass}`);
+  const ha2 = md5(`${method}:${uri}`);
+  const response = c.qop
+    ? md5(`${ha1}:${c.nonce}:${nc}:${cnonce}:${c.qop}:${ha2}`)
+    : md5(`${ha1}:${c.nonce}:${ha2}`);
+  let h = `Digest username="${user}", realm="${c.realm}", nonce="${c.nonce}", uri="${uri}", response="${response}"`;
+  if (c.qop) h += `, qop=${c.qop}, nc=${nc}, cnonce="${cnonce}"`;
+  if (c.opaque) h += `, opaque="${c.opaque}"`;
+  return h;
+}
+
 function digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj) {
   return new Promise((resolve, reject) => {
+    const key = `${ip}:${port}`;
     const body = bodyObj ? JSON.stringify(bodyObj) : null;
+    let challenges = 0;
     const doReq = (authHeader) => {
       const headers = { "Content-Type": "application/json" };
       if (body) headers["Content-Length"] = Buffer.byteLength(body);
@@ -187,9 +221,11 @@ function digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj) {
         res.setEncoding("utf8");
         res.on("data", (c) => (data += c));
         res.on("end", () => {
-          if (res.statusCode === 401 && !authHeader) {
-            const auth = buildDigestHeader(user, pass, method, path, res.headers["www-authenticate"] || "");
-            return doReq(auth);
+          if (res.statusCode === 401 && challenges < 2) {
+            // Fresh (or expired) nonce — cache it and retry once.
+            challenges += 1;
+            cacheChallenge(key, res.headers["www-authenticate"] || "");
+            return doReq(headerFromCache(key, user, pass, method, path));
           }
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve(data);
@@ -203,7 +239,8 @@ function digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj) {
       if (body) req.write(body);
       req.end();
     };
-    doReq(null);
+    // Preemptive: reuse the cached nonce so most requests are a single trip.
+    doReq(headerFromCache(key, user, pass, method, path));
   });
 }
 

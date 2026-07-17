@@ -151,21 +151,17 @@ function chatIdsFor(empId) {
 }
 
 async function sendToEmployee(empId, text) {
-  for (const chatId of chatIdsFor(empId)) {
-    try {
-      await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
-    } catch (e) {
-      console.error(`Failed to DM (${chatId}):`, e.message);
-    }
-  }
+  await Promise.all(chatIdsFor(empId).map((chatId) =>
+    bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" })
+      .catch((e) => console.error(`Failed to DM (${chatId}):`, e.message))
+  ));
 }
 
 // Check-in / check-out / no-show -> employee DM + the employee's COMPANY group
 async function notifyBoth(emp, text) {
   const co = companyFor(emp);
   console.log(`[notify DM+group ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
-  await sendToEmployee(emp.id, text);
-  await sendToGroup(text, co.groupChatId);
+  await Promise.all([sendToEmployee(emp.id, text), sendToGroup(text, co.groupChatId)]);
 }
 
 // Breaks and break warnings -> employee DM only
@@ -205,11 +201,20 @@ bot.command("health", async (ctx) => {
       results.push(`${label} (${chatId}): ❌ ${e.message}`);
     }
   }
-  const streams = [...streamState.entries()]
-    .map(([k, v]) => `${k}: ${v.live ? "LIVE" : "sync"}`)
-    .join("\n") || "(no device events seen yet)";
+  const devLines = [...new Set([...cfg.INSIDE_IPS, ...cfg.OUTSIDE_IPS])].map((ip) => {
+    const last = deviceLastEvent.get(ip);
+    const stream = streamState.get(ip);
+    const age = last ? `last event ${Math.round((Date.now() - last) / 1000)}s ago` : "waiting for first event";
+    const mode = cfg.ALERTSTREAM_ENABLED
+      ? (stream ? (stream.live ? "stream LIVE + poller" : "stream sync + poller") : "poller")
+      : "poller only";
+    return `${deviceLabel(ip)} (${ip}): ${mode}, ${age}`;
+  }).join("\n");
+  const hint = results.some((r) => r.includes("❌"))
+    ? "\n⚠️ Fix: add THIS bot to the failing group; if the group became a supergroup its ID changed (starts with -100...) — update TELEGRAM_CHAT_ID in .env and restart."
+    : "";
   return ctx.reply(
-    `🩺 <b>Health</b>\nBot: ✅ running\nGroups:\n${results.join("\n")}\nDevice streams:\n${streams}`,
+    `🩺 <b>Health</b>\nBot: ✅ running\nGroups:\n${results.join("\n")}${hint}\nDevices:\n${devLines}\nPolling every ${cfg.POLL_INTERVAL_MS / 1000}s`,
     { parse_mode: "HTML" }
   );
 });
@@ -492,17 +497,39 @@ async function runMaintenance(now = Date.now()) {
     }
   }
 
-  // --- C: sessions that never checked out ---
+  // --- C: sessions that never checked out -> AUTO CHECKOUT ---
+  // At the end of each shift's checkout window (i.e. before the NEW work day
+  // begins) every still-open check-in is converted into a real CHECKED OUT:
+  //   1) if the employee's LAST exit scan of that shift exists (walked out
+  //      with Face ID and never returned) — that scan's time is the checkout;
+  //   2) if there is no exit scan at all — the scheduled shift end is used.
+  // This wipes yesterday's open state completely, so the new day always
+  // starts fresh with a clean check-in/check-out cycle.
   for (const srow of store.staleSessions()) {
     const emp = findEmployee(srow.emp_id, true);
     const rule = emp && SHIFT_RULES[emp.shiftKey];
     if (!rule) continue;
     const deadline = Date.parse(`${addDays(srow.work_date, rule.checkOutDayOffset)}T${rule.validCheckOutTo}:00+05:00`);
-    if (Number.isFinite(deadline) && now > deadline) {
-      store.setDeparture(srow.emp_id, srow.work_date, -1); // sentinel: no checkout scan
-      logEvent(`AUTO-CLOSE session without checkout: ${emp.name} (${srow.work_date})`);
-      appendRow([srow.work_date, emp.id, emp.name, "Session closed", "-", "No checkout scan recorded — closed automatically"], companyFor(emp).sheetName);
+    if (!Number.isFinite(deadline) || now <= deadline) continue;
+
+    const lastBrk = store.lastBreakOfSession(srow.emp_id, srow.work_date);
+    let outTs = lastBrk && lastBrk.out_ts > srow.arrival ? Number(lastBrk.out_ts) : null;
+    let note;
+    if (outTs) {
+      note = "Auto checkout — left without a fingerprint checkout; time taken from the last exit scan.";
+    } else {
+      outTs = Date.parse(`${addDays(srow.work_date, rule.checkOutDayOffset)}T${rule.workEnd}:00+05:00`);
+      note = "Auto checkout — no checkout scan was recorded; scheduled shift end used.";
     }
+    if (!Number.isFinite(outTs) || outTs <= srow.arrival) outTs = Number(srow.arrival);
+
+    store.setDeparture(srow.emp_id, srow.work_date, outTs);
+    const workedMin = Math.round((outTs - srow.arrival) / 60000);
+    const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
+    logEvent(`AUTO-CHECKOUT: ${emp.name} (${srow.work_date}) at ${fmtTime(outTs)} — ${note}`);
+    await notifyBoth(emp,
+      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
+    appendRow([srow.work_date, emp.id, emp.name, "Checked out", fmtTime(outTs), note + ` (worked ${worked})`], companyFor(emp).sheetName);
   }
 }
 
@@ -534,6 +561,9 @@ setInterval(async () => {
 }, 60 * 1000);
 
 // ============================= EVENT PROCESSING =============================
+
+// Last processed event per device (any source) — shown in /health
+const deviceLastEvent = new Map();
 
 // Per-device stream state: SYNC (history replay) -> LIVE
 const streamState = new Map(); // deviceKey -> { live, timer }
@@ -641,6 +671,7 @@ async function processEvent(evt, sourceIp, source) {
     }
 
     const ts = Date.now();
+    deviceLastEvent.set(deviceIp, ts);
     console.log(`[event ${source}] ${emp.name} (${emp.id}) ${kind.toUpperCase()} @ ${deviceLabel(deviceIp)}`);
     await handleAuthEvent(emp, ts, deviceIp, kind);
   } catch (e) {

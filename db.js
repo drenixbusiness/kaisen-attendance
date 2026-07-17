@@ -96,6 +96,9 @@ module.exports = {
     db.prepare("SELECT * FROM breaks WHERE in_ts IS NULL").all(),
   voidBreak: (id) =>
     db.prepare("UPDATE breaks SET in_ts = out_ts, warned = 1 WHERE id=?").run(Number(id)),
+  lastBreakOfSession: (empId, workDate) =>
+    db.prepare("SELECT * FROM breaks WHERE emp_id=? AND work_date=? ORDER BY out_ts DESC LIMIT 1")
+      .get(String(empId), workDate),
   staleSessions: () =>
     db.prepare("SELECT * FROM attendance WHERE arrival IS NOT NULL AND departure IS NULL").all(),
 

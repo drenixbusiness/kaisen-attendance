@@ -51,11 +51,11 @@ module.exports = {
   },
 
   // Days when No Show alerts are NOT sent (0=Sunday, 1=Monday ... 6=Saturday)
-  NO_SHOW_OFF_DAYS: [0,6],
+  NO_SHOW_OFF_DAYS: [0],
 
   BREAK_LIMIT_MIN: 30,          // break limit (minutes)
-  FACE_EXIT_CHECKOUT_MIN: 40,   // Face ID exit in the checkout window with no
-                                // return within this many minutes = CHECKOUT
+  FACE_EXIT_CHECKOUT_MIN: 30,   // After the shift ends: a Face ID exit with no
+                                // return within 30 minutes = CHECKOUT
   STALE_BREAK_HOURS: 3,         // abandoned open breaks are voided after this
   DEDUP_SECONDS: 180,           // window for ignoring repeated face scans
 
