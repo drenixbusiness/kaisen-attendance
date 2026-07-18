@@ -795,9 +795,22 @@ if (!TEST_MODE) {
     console.log(`HTTP listener: 0.0.0.0:${cfg.PORT}${cfg.EVENT_PATH}`);
   });
 
+  // ===== STARTUP SELF-DIAGNOSTICS — pm2 logs will name the exact problem =====
+  console.log(`── ${cfg.COMPANY_NAME} bot starting ──`);
+  console.log(`Employees: ${Object.keys(EMPLOYEES).length} | Port: ${cfg.PORT} | Poll: ${cfg.POLL_INTERVAL_MS / 1000}s | alertStream: ${cfg.ALERTSTREAM_ENABLED ? "on" : "off"}`);
+  try {
+    const subs = store.chatsForEmployee ? "" : "";
+  } catch (_) {}
   bot.telegram.getMe()
-    .then((me) => console.log(`Telegram OK ✅ — bot @${me.username} is ready (${cfg.TELEGRAM_MODE} mode)`))
-    .catch((e) => console.error(`TELEGRAM ERROR ❌ — token or network problem: ${e.message}`));
+    .then((me) => console.log(`Telegram token OK ✅ — bot @${me.username}`))
+    .catch((e) => console.error(`TELEGRAM TOKEN ERROR ❌ — ${e.message} (check TELEGRAM_BOT_TOKEN in .env)`));
+  // Verify the group WITHOUT sending a message
+  bot.telegram.getChat(cfg.GROUP_CHAT_ID)
+    .then((c) => console.log(`Group OK ✅ — "${c.title || c.id}" (${cfg.GROUP_CHAT_ID})`))
+    .catch((e) => {
+      console.error(`GROUP ERROR ❌ — ${cfg.GROUP_CHAT_ID}: ${e.message}`);
+      console.error(`  FIX: 1) Add THIS bot to that group. 2) If the group became a supergroup, its ID changed (starts with -100...) — post a message in the group, open https://api.telegram.org/bot<TOKEN>/getUpdates, take chat.id, update TELEGRAM_CHAT_ID in .env, restart.`);
+    });
 
   if (!cfg.TELEGRAM_POLLING || cfg.TELEGRAM_MODE === "worker") {
     // Workers only SEND messages. Polling stays off so the single shared bot
@@ -807,7 +820,19 @@ if (!TEST_MODE) {
       ? "Worker mode: Telegram polling disabled — /start is handled by the master instance"
       : "Independent mode: Telegram polling disabled — DM chat ids come from employees.json (chatId)");
   } else {
-    bot.launch().catch((e) => console.error(`bot.launch failed: ${e.message}`));
+    const launchPolling = (attempt = 1) => {
+      bot.launch()
+        .then(() => console.log("Telegram polling started ✅ — /start /stop /health are ACTIVE"))
+        .catch((e) => {
+          console.error(`TELEGRAM POLLING FAILED ❌ (attempt ${attempt}): ${e.message}`);
+          if (/409/.test(e.message)) {
+            console.error("  FIX: ANOTHER process is polling this SAME token (an old bot is still running).");
+            console.error("  Run `pm2 list`, find the old process, `pm2 delete <old-name>` — this bot will recover automatically.");
+          }
+          setTimeout(() => launchPolling(attempt + 1), 15000);
+        });
+    };
+    launchPolling();
     process.once("SIGINT", () => bot.stop("SIGINT"));
     process.once("SIGTERM", () => bot.stop("SIGTERM"));
   }
