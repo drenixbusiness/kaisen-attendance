@@ -128,13 +128,33 @@ if (TEST_MODE) {
   };
 }
 
-async function sendToGroup(text, chatId = cfg.GROUP_CHAT_ID) {
-  try {
-    await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
-  } catch (e) {
-    console.error(`Failed to send to group ${chatId}:`, e.message);
-    console.error("  -> Check: is the bot added to the group? If the group was upgraded to a supergroup, its ID changed (starts with -100...) — update TELEGRAM_CHAT_ID in .env.");
+// Send with retry: transient network/DNS failures (EAI_AGAIN, timeouts,
+// resets) must never lose a check-in/checkout message. Permanent errors
+// (chat not found, bot blocked) are reported once without retrying.
+async function tgSend(chatId, text, tag) {
+  const MAX = 6;
+  for (let a = 1; a <= MAX; a++) {
+    try {
+      return await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
+    } catch (e) {
+      const msg = String(e.message || "");
+      const permanent = /chat not found|bot was blocked|user is deactivated|bot was kicked|not enough rights|400: Bad Request/i.test(msg);
+      if (permanent || a === MAX) {
+        console.error(`${tag} ${chatId}: ${msg}`);
+        if (/chat not found/i.test(msg)) {
+          console.error("  -> Check: is the bot added to the group? If the group was upgraded to a supergroup, its ID changed (starts with -100...) — update TELEGRAM_CHAT_ID in .env.");
+        }
+        return null;
+      }
+      // transient (DNS EAI_AGAIN, ETIMEDOUT, ECONNRESET, 5xx, 429...) — wait & retry
+      await new Promise((r) => setTimeout(r, Math.min(10000 * a, 45000)));
+    }
   }
+  return null;
+}
+
+async function sendToGroup(text, chatId = cfg.GROUP_CHAT_ID) {
+  await tgSend(chatId, text, "Failed to send to group");
 }
 
 // DM targets = DB subscriptions (/start flow) UNION static "chatId" values
@@ -151,10 +171,7 @@ function chatIdsFor(empId) {
 }
 
 async function sendToEmployee(empId, text) {
-  await Promise.all(chatIdsFor(empId).map((chatId) =>
-    bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" })
-      .catch((e) => console.error(`Failed to DM (${chatId}):`, e.message))
-  ));
+  await Promise.all(chatIdsFor(empId).map((chatId) => tgSend(chatId, text, "Failed to DM")));
 }
 
 // Check-in / check-out / no-show -> employee DM + the employee's COMPANY group
@@ -652,7 +669,7 @@ async function processEvent(evt, sourceIp, source) {
       const k = `unk:${rawId}`;
       if (!global.__unkWarned) global.__unkWarned = new Map();
       const lastW = global.__unkWarned.get(k) || 0;
-      if (Date.now() - lastW > 3600 * 1000) {
+      if (Date.now() - lastW > 24 * 3600 * 1000) {
         global.__unkWarned.set(k, Date.now());
         console.warn(`⚠️  UNKNOWN employee scanned: ID=${rawId} name=${nm} — if this is OUR employee, add them to employees.json and restart`);
       }
