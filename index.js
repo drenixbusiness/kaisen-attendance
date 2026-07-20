@@ -647,7 +647,17 @@ async function processEvent(evt, sourceIp, source) {
     logEvent(`src=${source} | ip=${deviceIp} | empId=${rawId} | name=${ace.name || "-"} | subEventType=${sub} | verifyMode=${ace.currentVerifyMode || "-"} | ${kind ? kind.toUpperCase() : "UNKNOWN"}`);
 
     const emp = findEmployee(rawId, true); // exact — device IDs are verbatim
-    if (!emp) return logEvent(`IGNORE: empId=${rawId} not found in employees.json`);
+    if (!emp) {
+      const nm = (evt.AccessControllerEvent && evt.AccessControllerEvent.name) || "?";
+      const k = `unk:${rawId}`;
+      if (!global.__unkWarned) global.__unkWarned = new Map();
+      const lastW = global.__unkWarned.get(k) || 0;
+      if (Date.now() - lastW > 3600 * 1000) {
+        global.__unkWarned.set(k, Date.now());
+        console.warn(`⚠️  UNKNOWN employee scanned: ID=${rawId} name=${nm} — if this is OUR employee, add them to employees.json and restart`);
+      }
+      return logEvent(`IGNORE: empId=${rawId} (${nm}) not found in employees.json`);
+    }
 
     // Split deployment: each instance processes ONLY its own company's
     // employees, so two instances can never double-handle the same scan.

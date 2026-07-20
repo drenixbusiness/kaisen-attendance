@@ -20,7 +20,12 @@ function isoInTz(ms, tzSuffix) {
 function startPolling(ip, port, user, pass, onEvent, log = console.log, intervalMs = 4000) {
   let clockOffset = null;      // device clock - server clock (ms)
   let tzSuffix = "+05:00";
-  let lastSerial = -1;
+  const seen = new Map();      // serialNo -> first-seen wall time (dedupe that
+                               // survives out-of-order / delayed device commits)
+  const SEEN_TTL = 26 * 3600 * 1000;
+  let lastEventDevTime = null; // device-time of the newest event ever seen —
+                               // the search window is ANCHORED here, so events
+                               // can never age out during outages/errors
   let initialized = false;     // first cycle sets the baseline without notifying
   let inFlight = false;
   let lastClockSync = 0;
@@ -50,7 +55,7 @@ function startPolling(ip, port, user, pass, onEvent, log = console.log, interval
   async function fetchWindow(startIso, endIso) {
     const infos = [];
     let pos = 0;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < 40; page++) {
       const body = {
         AcsEventCond: {
           searchID: "drenix-attendance-bot",
@@ -80,22 +85,37 @@ function startPolling(ip, port, user, pass, onEvent, log = console.log, interval
         await syncClock();
       }
       const devNow = Date.now() + clockOffset;
-      const infos = await fetchWindow(isoInTz(devNow - 5 * 60 * 1000, tzSuffix), isoInTz(devNow + 2 * 60 * 1000, tzSuffix));
+      // Window start: a WIDE 60-minute base window (catches events the device
+      // commits late or backdates after an offline sync), additionally anchored
+      // at 60s before the last seen event — so even if polling was down for
+      // hours, the recovery window covers the WHOLE gap. Capped at 24h. The
+      // seen-set guarantees nothing is ever processed twice.
+      let winStart = devNow - 60 * 60 * 1000;
+      if (lastEventDevTime !== null) winStart = Math.min(winStart, lastEventDevTime - 60 * 1000);
+      winStart = Math.max(winStart, devNow - 24 * 3600 * 1000);
+      const infos = await fetchWindow(isoInTz(winStart, tzSuffix), isoInTz(devNow + 2 * 60 * 1000, tzSuffix));
 
-      let maxSerial = lastSerial;
       const fresh = [];
       for (const info of infos) {
         const sn = Number(info.serialNo);
         if (!Number.isFinite(sn)) continue;
-        if (sn > maxSerial) maxSerial = sn;
-        if (initialized && sn > lastSerial) fresh.push(info);
+        const t = Date.parse(info.time);
+        if (Number.isFinite(t) && (lastEventDevTime === null || t > lastEventDevTime)) lastEventDevTime = t;
+        if (seen.has(sn)) continue;      // already processed (any order)
+        seen.set(sn, Date.now());
+        if (initialized) fresh.push(info);
       }
       fresh.sort((a, b) => Number(a.serialNo) - Number(b.serialNo));
-      lastSerial = maxSerial;
+
+      // prune old dedupe entries
+      if (seen.size > 500) {
+        const cut = Date.now() - SEEN_TTL;
+        for (const [k, v] of seen) if (v < cut) seen.delete(k);
+      }
 
       if (!initialized) {
         initialized = true;
-        log(`[poller ${ip}:${port}] active ✅ (baseline serialNo=${lastSerial}, device clock offset ${Math.round(clockOffset / 1000)}s, every ${intervalMs / 1000}s)`);
+        log(`[poller ${ip}:${port}] active ✅ (baseline ${seen.size} events, device clock offset ${Math.round(clockOffset / 1000)}s, every ${intervalMs / 1000}s)`);
       }
 
       for (const info of fresh) {
