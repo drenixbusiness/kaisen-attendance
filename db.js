@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS noshow (
   work_date TEXT NOT NULL,
   PRIMARY KEY (emp_id, work_date)
 );
+CREATE TABLE IF NOT EXISTS raw_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  emp_id     TEXT,
+  name       TEXT,
+  event_type TEXT NOT NULL,
+  device_ip  TEXT,
+  ts         INTEGER NOT NULL,
+  source     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_events_emp ON raw_events(emp_id, ts);
 CREATE TABLE IF NOT EXISTS breaks (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   emp_id    TEXT NOT NULL,
@@ -96,6 +106,12 @@ module.exports = {
     db.prepare("SELECT * FROM breaks WHERE in_ts IS NULL").all(),
   voidBreak: (id) =>
     db.prepare("UPDATE breaks SET in_ts = out_ts, warned = 1 WHERE id=?").run(Number(id)),
+  logRawEvent: (empId, name, eventType, deviceIp, ts, source) =>
+    db.prepare("INSERT INTO raw_events (emp_id, name, event_type, device_ip, ts, source) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(empId != null ? String(empId) : null, name || null, eventType, deviceIp || null, ts, source || null),
+  rawEventsFor: (empId, sinceTs = 0) =>
+    db.prepare("SELECT * FROM raw_events WHERE emp_id=? AND ts>=? ORDER BY ts ASC").all(String(empId), sinceTs),
+
   lastBreakOfSession: (empId, workDate) =>
     db.prepare("SELECT * FROM breaks WHERE emp_id=? AND work_date=? ORDER BY out_ts DESC LIMIT 1")
       .get(String(empId), workDate),

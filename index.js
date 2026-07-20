@@ -365,11 +365,20 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
     if (open) {
       return doBreakIn(emp, ts, devName, open);
     }
-    // 2) Not checked in yet and inside the check-in zone -> CHECK IN.
+    // 2) Not checked in yet TODAY -> CHECK IN, at ANY time of day. There is
+    //    no earliest-allowed clock time anymore: an employee who arrives
+    //    hours before their shift MUST be recognized immediately (previously
+    //    a scan before validCheckInFrom was silently dropped as "entered, no
+    //    break counted", so the employee looked absent until a later scan —
+    //    which then got wrongly marked as their check-in time, often "Late").
+    //    The only real guard needed is: don't open a second, overlapping
+    //    check-in while a PREVIOUS shift's session is still unresolved
+    //    (relevant for overnight shifts just after midnight) — that is
+    //    exactly what store.activeSession() (any date) protects against.
     //    Works for fingerprint AND Face ID AND unknown auth codes, so a
     //    forgotten fingerprint or an unrecognized event code can never
     //    silently swallow a check-in again.
-    if ((!todayRec || !todayRec.arrival) && m >= toMin(rule.validCheckInFrom)) {
+    if ((!todayRec || !todayRec.arrival) && !store.activeSession(emp.id)) {
       const label = kind === "face" ? `${devName} (via Face ID)` : devName;
       return doCheckIn(emp, ts, label, rule, today);
     }
@@ -438,8 +447,10 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
   }
 
   // No active session: a fingerprint here in the check-in zone means the
-  // employee scanned the WRONG device to check in — still count it.
-  if (kind === "fp" && (!todayRec || !todayRec.arrival) && m >= toMin(rule.validCheckInFrom)) {
+  // employee scanned the WRONG device to check in — still count it, at any
+  // time (see the OUTSIDE-device comment above for why there is no longer a
+  // clock-time lower bound).
+  if (kind === "fp" && (!todayRec || !todayRec.arrival)) {
     return doCheckIn(emp, ts, `${devName} (wrong device)`, rule, today);
   }
   // Distinguish "exit after an already-completed checkout" (e.g. a Face ID
@@ -662,6 +673,25 @@ async function processEvent(evt, sourceIp, source) {
 
     const deviceIp = evt.ipAddress || sourceIp || "?";
     logEvent(`src=${source} | ip=${deviceIp} | empId=${rawId} | name=${ace.name || "-"} | subEventType=${sub} | verifyMode=${ace.currentVerifyMode || "-"} | ${kind ? kind.toUpperCase() : "UNKNOWN"}`);
+    if (!kind) kind = "other";
+
+    // ===== RAW EVENT LOG — every Face/Fingerprint authentication event is
+    // recorded in the local database (Employee ID + Event Type), exactly
+    // like the device's own event history, REGARDLESS of whether the
+    // employee is recognized or what the attendance logic decides to do
+    // with it. This is a pure audit trail and can never be skipped. =====
+    const dedupeKeyRaw = `${deviceIp}:${rawId}:${kind}:${ace.serialNo || Math.floor(Date.now() / 10000)}`;
+    if (isDuplicate(dedupeKeyRaw)) {
+      return logEvent(`DEDUP source: empId=${rawId} — same scan already processed`);
+    }
+    const eventTypeLabel = kind === "face" ? "Authenticated via Face"
+      : kind === "fp" ? "Authenticated via Fingerprint"
+      : "Authenticated via Other";
+    try {
+      store.logRawEvent(rawId, ace.name || null, eventTypeLabel, deviceIp, Date.now(), source);
+    } catch (e) {
+      console.error("raw_events yozishda xato:", e.message);
+    }
 
     const emp = findEmployee(rawId, true); // exact — device IDs are verbatim
     if (!emp) {
@@ -682,19 +712,11 @@ async function processEvent(evt, sourceIp, source) {
       return logEvent(`SKIP: ${emp.name} belongs to '${emp.company}' — handled by that company's instance`);
     }
 
-    if (!kind) {
+    if (kind === "other") {
       // Unrecognized auth code: keep the raw dump for diagnostics, but do NOT
       // drop the event — the direction-based logic below can still use it
       // (e.g. an unknown fingerprint code on the outside device is a check-in).
       logEvent(`UNKNOWN RAW: ${JSON.stringify(evt)}`);
-      kind = "other";
-    }
-    const isFp = kind === "fp";
-
-    // dedupe across the two sources
-    const dedupeKey = `${deviceIp}:${emp.id}:${isFp ? "fp" : "face"}:${ace.serialNo || Math.floor(Date.now() / 10000)}`;
-    if (isDuplicate(dedupeKey)) {
-      return logEvent(`DEDUP source: ${emp.name} — same scan already processed`);
     }
 
     const ts = Date.now();
