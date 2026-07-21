@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS raw_events (
   source     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_raw_events_emp ON raw_events(emp_id, ts);
+CREATE TABLE IF NOT EXISTS flagged_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  emp_id     TEXT NOT NULL,
+  work_date  TEXT NOT NULL,
+  event_type TEXT NOT NULL,   -- 'late_checkin' | 'no_show' | 'break_warning'
+  chat_id    TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  sheet_name TEXT,
+  sheet_row  INTEGER,
+  notes      TEXT NOT NULL DEFAULT '',
+  created_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flag_reply ON flagged_events(chat_id, message_id);
 CREATE TABLE IF NOT EXISTS breaks (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   emp_id    TEXT NOT NULL,
@@ -111,6 +124,33 @@ module.exports = {
       .run(empId != null ? String(empId) : null, name || null, eventType, deviceIp || null, ts, source || null),
   rawEventsFor: (empId, sinceTs = 0) =>
     db.prepare("SELECT * FROM raw_events WHERE emp_id=? AND ts>=? ORDER BY ts ASC").all(String(empId), sinceTs),
+
+  // --- /notes: reply-to-message flagged events (late checkin / no-show / break warning) ---
+  createFlag: (empId, workDate, eventType, chatId, messageId, sheetName) => {
+    const r = db.prepare(
+      "INSERT INTO flagged_events (emp_id, work_date, event_type, chat_id, message_id, sheet_name, notes, created_ts) VALUES (?, ?, ?, ?, ?, ?, '', ?)"
+    ).run(String(empId), workDate, eventType, String(chatId), Number(messageId), sheetName || null, Date.now());
+    return Number(r.lastInsertRowid);
+  },
+  // Records the Sheets row number for a flag; returns its CURRENT notes text
+  // (non-empty only if the employee already replied before the row was known
+  // — e.g. Sheets was briefly unreachable — so the caller can push it now).
+  setFlagSheetRow: (flagId, row) => {
+    db.prepare("UPDATE flagged_events SET sheet_row=? WHERE id=?").run(Number(row), Number(flagId));
+    const r = db.prepare("SELECT notes FROM flagged_events WHERE id=?").get(Number(flagId));
+    return r && r.notes ? r.notes : null;
+  },
+  findFlagByReply: (chatId, messageId) =>
+    db.prepare("SELECT * FROM flagged_events WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1")
+      .get(String(chatId), Number(messageId)),
+  // Appends (never overwrites) a new note onto the flag's notes text.
+  appendFlagNote: (flagId, noteText, tag) => {
+    const cur = db.prepare("SELECT notes FROM flagged_events WHERE id=?").get(Number(flagId));
+    const prefixed = tag ? `${tag} — ${noteText}` : noteText;
+    const merged = (cur && cur.notes) ? `${cur.notes} | ${prefixed}` : prefixed;
+    db.prepare("UPDATE flagged_events SET notes=? WHERE id=?").run(merged, Number(flagId));
+    return merged;
+  },
 
   lastBreakOfSession: (empId, workDate) =>
     db.prepare("SELECT * FROM breaks WHERE emp_id=? AND work_date=? ORDER BY out_ts DESC LIMIT 1")

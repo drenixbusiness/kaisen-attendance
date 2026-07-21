@@ -27,7 +27,7 @@ const { Telegraf } = require("telegraf");
 const cfg = require("./config");
 const SHIFT_RULES = require("./shifts");
 const store = require("./db");
-const { appendRow } = require("./sheets");
+const { appendRow, updateNoteCell } = require("./sheets");
 const { subscribeDevice } = require("./alertstream");
 const { startPolling } = require("./poller");
 
@@ -86,6 +86,28 @@ function fmtDate(ts) {
   }).format(new Date(ts)); // YYYY-MM-DD
 }
 
+function fmtDateTime(ts) {
+  return `${fmtDate(ts)} ${fmtTime(ts)}`;
+}
+
+// Builds one Google Sheets row in the fixed 10-column order:
+// Time Local | Employee id | Employee Name | Action | Shift Time |
+// Shift Date | Late Minutes | Status | Notes | Didn't Come
+function buildSheetRow({ ts, emp, rule, workDate, action, lateMin, status, notes, didntCome }) {
+  return [
+    fmtDateTime(ts),
+    emp.id,
+    emp.name,
+    action,
+    rule ? `${rule.workStart} - ${rule.workEnd}` : "",
+    workDate,
+    (lateMin === undefined || lateMin === null || lateMin === "") ? "" : lateMin,
+    status || "",
+    notes || "",
+    didntCome ? "Yes" : "",
+  ];
+}
+
 function localMinutes(ts) {
   const p = new Intl.DateTimeFormat("en-GB", {
     timeZone: cfg.TZ, hour: "2-digit", minute: "2-digit", hour12: false,
@@ -123,8 +145,11 @@ function logEvent(line) {
 
 const bot = new Telegraf(cfg.BOT_TOKEN || "test-token");
 if (TEST_MODE) {
+  global.__msgSeq = global.__msgSeq || 1000;
   bot.telegram.sendMessage = async (chat, text) => {
-    (global.__SENT = global.__SENT || []).push({ chat: String(chat), text });
+    const message_id = ++global.__msgSeq;
+    (global.__SENT = global.__SENT || []).push({ chat: String(chat), text, message_id });
+    return { message_id, chat: { id: chat } };
   };
 }
 
@@ -179,6 +204,35 @@ async function notifyBoth(emp, text) {
   const co = companyFor(emp);
   console.log(`[notify DM+group ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
   await Promise.all([sendToEmployee(emp.id, text), sendToGroup(text, co.groupChatId)]);
+}
+
+// Like notifyBoth, but for the THREE "flaggable" event types the employee can
+// explain via /notes (late check-in, No Show, break warning): captures the
+// DM message_id(s) so a later reply can be matched back to this exact event.
+async function notifyBothFlagged(emp, text, eventType, workDate) {
+  const co = companyFor(emp);
+  console.log(`[notify DM+group ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
+  const [dmResults] = await Promise.all([
+    Promise.all(chatIdsFor(emp.id).map(async (chatId) => {
+      const msg = await tgSend(chatId, text, "Failed to DM");
+      return msg && msg.message_id ? { chatId, messageId: msg.message_id } : null;
+    })),
+    sendToGroup(text, co.groupChatId),
+  ]);
+  const flagIds = [];
+  for (const r of dmResults) {
+    if (r) flagIds.push(store.createFlag(emp.id, workDate, eventType, r.chatId, r.messageId, co.sheetName));
+  }
+  return flagIds;
+}
+
+// Once a flagged event's Sheets row number becomes known (immediately, or
+// later via the retry queue after an outage), push any notes already
+// accumulated for it into the Notes cell — nothing typed early is ever lost.
+function linkSheetRow(flagId, sheetName, rowNum) {
+  if (!flagId || !rowNum) return;
+  const notes = store.setFlagSheetRow(flagId, rowNum);
+  if (notes) updateNoteCell(sheetName, rowNum, notes).catch(() => {});
 }
 
 // Breaks and break warnings -> employee DM only
@@ -242,6 +296,33 @@ bot.command("stop", (ctx) => {
   return ctx.reply("✅ Unsubscribed — all your data has been cleared. Send /start to connect again.");
 });
 
+// /notes — ONLY works as a REPLY (in the private DM) to one of the bot's own
+// Late check-in / No Show / Break-warning messages. The explanation is
+// APPENDED to that specific event's Notes cell in Google Sheets — an earlier
+// note is never overwritten, the new one is simply added alongside it.
+async function handleNotesCommand(ctx) {
+  if (ctx.chat.type !== "private") return; // group usage is silently ignored
+  const replyTo = ctx.message.reply_to_message;
+  if (!replyTo) {
+    return ctx.reply("ℹ️ Please REPLY to the bot's Late / No Show / Break-warning message with /notes <reason> to explain it.");
+  }
+  const flag = store.findFlagByReply(ctx.chat.id, replyTo.message_id);
+  if (!flag) {
+    return ctx.reply("❌ This message doesn't accept notes — only Late check-in, No Show, and Break-warning messages do.");
+  }
+  const noteText = ctx.message.text.replace(/^\/notes(@\w+)?\s*/i, "").trim();
+  if (!noteText) {
+    return ctx.reply("ℹ️ Please write your reason after the command, e.g.: /notes bus was late");
+  }
+  const tag = fmtTime(Date.now());
+  const merged = store.appendFlagNote(flag.id, noteText, tag);
+  if (flag.sheet_row) {
+    await updateNoteCell(flag.sheet_name, flag.sheet_row, merged).catch(() => {});
+  } // if the row isn't known yet (Sheets was briefly down), linkSheetRow() will push it once it is
+  return ctx.reply("✅ Your note has been saved.");
+}
+bot.command("notes", handleNotesCommand);
+
 bot.on("text", (ctx) => {
   const st = regState.get(ctx.chat.id);
   if (!st) return;
@@ -299,9 +380,22 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const m = localMinutes(ts);
   store.setArrival(emp.id, today, ts);
   const st = arrivalStatus(m, rule);
-  await notifyBoth(emp,
-    `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`);
-  appendRow([today, emp.id, emp.name, "Checked in", fmtTime(ts), st.note], companyFor(emp).sheetName);
+  const diff = m - toMin(rule.workStart);
+  const isLate = diff > rule.lateAllowableMin; // covers both "Late" and "Very late — No Show"
+  const lateMin = isLate ? diff : 0;
+  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`;
+  const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
+  const sheetName = companyFor(emp).sheetName;
+  if (isLate) {
+    // Flaggable: the employee can reply to THIS message with /notes to explain.
+    text += `\n\n💬 Reply to this message with /notes <reason> to explain why you were late.`;
+    const flagIds = await notifyBothFlagged(emp, text, "late_checkin", today);
+    const rowNum = await appendRow(row, sheetName);
+    if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
+  } else {
+    await notifyBoth(emp, text);
+    appendRow(row, sheetName);
+  }
 }
 
 // Direction-aware event handling.
@@ -323,7 +417,7 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
   await notifyBoth(emp,
     `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
-  appendRow([workDate, emp.id, emp.name, "Checked out", fmtTime(ts), `Worked: ${worked}`], companyFor(emp).sheetName);
+  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out", notes: `Worked: ${worked}` }), companyFor(emp).sheetName);
 }
 
 async function doBreakIn(emp, ts, devName, open) {
@@ -332,8 +426,12 @@ async function doBreakIn(emp, ts, devName, open) {
   const over = dur > cfg.BREAK_LIMIT_MIN;
   // No Telegram message for break returns — tracked in events.log and Sheets.
   console.log(`[break in] ${emp.name} @ ${fmtTime(ts)} — ${dur} min${over ? " (OVER LIMIT)" : ""}`);
-  appendRow([open.work_date, emp.id, emp.name, "Back from break", fmtTime(ts),
-    over ? `${dur} min (over limit)` : `${dur} min`], companyFor(emp).sheetName);
+  const rule = SHIFT_RULES[emp.shiftKey];
+  appendRow(buildSheetRow({
+    ts, emp, rule, workDate: open.work_date, action: "Back from break",
+    status: over ? "Over limit" : "",
+    notes: over ? `${dur} min (over limit)` : `${dur} min`,
+  }), companyFor(emp).sheetName);
 }
 
 async function doBreakOut(emp, ts, devName, workDate, note = "") {
@@ -341,7 +439,8 @@ async function doBreakOut(emp, ts, devName, workDate, note = "") {
   // No Telegram message for normal break-outs — only the 30-min warning is
   // sent. Everything is still tracked in events.log and Google Sheets.
   console.log(`[break out] ${emp.name} @ ${fmtTime(ts)} (${devName})${note ? " — " + note : ""}`);
-  appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), note], companyFor(emp).sheetName);
+  const rule = SHIFT_RULES[emp.shiftKey];
+  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Break started", notes: note }), companyFor(emp).sheetName);
 }
 
 async function handleAuthEvent(emp, ts, deviceIp, kind) {
@@ -392,7 +491,7 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
     }
     logEvent(`ENTER-only outside ${kind}: ${emp.name} — no matching exit scan before this entry`);
     console.log(`[entered] ${emp.name} @ ${fmtTime(ts)} — no prior exit scan, no break counted`);
-    appendRow([today, emp.id, emp.name, "Entered (no exit scan)", fmtTime(ts), ""], companyFor(emp).sheetName);
+    appendRow(buildSheetRow({ ts, emp, rule, workDate: today, action: "Entered (no exit scan)" }), companyFor(emp).sheetName);
     return;
   }
 
@@ -418,7 +517,7 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
       }
       logEvent(`EXIT after checkout: ${emp.name} (${workDate})`);
       console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — already checked out`);
-      appendRow([workDate, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
+      appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Exited (after checkout)" }), companyFor(emp).sheetName);
       return;
     }
     // no check-in for that shift date — fall through to the session logic
@@ -464,12 +563,12 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
     }
     logEvent(`EXIT after checkout: ${emp.name}`);
     console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — already checked out`);
-    appendRow([today, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
+    appendRow(buildSheetRow({ ts, emp, rule, workDate: today, action: "Exited (after checkout)" }), companyFor(emp).sheetName);
     return;
   }
   logEvent(`EXIT without check-in: ${emp.name}`);
   console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — no check-in today`);
-  appendRow([today, emp.id, emp.name, "Exited (no check-in)", fmtTime(ts), ""], companyFor(emp).sheetName);
+  appendRow(buildSheetRow({ ts, emp, rule, workDate: today, action: "Exited (no check-in)" }), companyFor(emp).sheetName);
   return;
 }
 
@@ -502,7 +601,10 @@ async function runMaintenance(now = Date.now()) {
         logEvent(`FACE-EXIT->CHECKOUT: ${emp.name} left at ${fmtTime(b.out_ts)} with Face ID and did not return`);
         await notifyBoth(emp,
           `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
-        appendRow([b.work_date, emp.id, emp.name, "Checked out", fmtTime(b.out_ts), `Face ID exit, no return — auto checkout (worked ${worked})`], companyFor(emp).sheetName);
+        appendRow(buildSheetRow({
+          ts: b.out_ts, emp, rule, workDate: b.work_date, action: "Checked out",
+          notes: `Face ID exit, no return — auto checkout (worked ${worked})`,
+        }), companyFor(emp).sheetName);
       }
       continue;
     }
@@ -512,16 +614,24 @@ async function runMaintenance(now = Date.now()) {
     if (now - b.out_ts > cfg.STALE_BREAK_HOURS * 3600 * 1000) {
       store.voidBreak(b.id);
       logEvent(`AUTO-VOID stale open break: ${emp.name} (out at ${fmtTime(b.out_ts)}, never returned)`);
-      appendRow([b.work_date, emp.id, emp.name, "Break voided", fmtTime(now), "Never returned — voided automatically"], companyFor(emp).sheetName);
+      appendRow(buildSheetRow({
+        ts: now, emp, rule, workDate: b.work_date, action: "Break voided",
+        status: "Voided", notes: "Never returned — voided automatically",
+      }), companyFor(emp).sheetName);
       continue;
     }
 
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      await notifyBoth(emp,
-        `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
-      appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`], companyFor(emp).sheetName);
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}\n\n💬 Reply to this message with /notes <reason> to explain.`;
+      const sheetName = companyFor(emp).sheetName;
+      const flagIds = await notifyBothFlagged(emp, warnText, "break_warning", b.work_date);
+      const rowNum = await appendRow(buildSheetRow({
+        ts: now, emp, rule, workDate: b.work_date, action: "WARNING",
+        status: "Break over limit", notes: `Break ${dur} min — over limit`,
+      }), sheetName);
+      if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
     }
   }
 
@@ -557,7 +667,10 @@ async function runMaintenance(now = Date.now()) {
     logEvent(`AUTO-CHECKOUT: ${emp.name} (${srow.work_date}) at ${fmtTime(outTs)} — ${note}`);
     await notifyBoth(emp,
       `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
-    appendRow([srow.work_date, emp.id, emp.name, "Checked out", fmtTime(outTs), note + ` (worked ${worked})`], companyFor(emp).sheetName);
+    appendRow(buildSheetRow({
+      ts: outTs, emp, rule, workDate: srow.work_date, action: "Checked out",
+      notes: note + ` (worked ${worked})`,
+    }), companyFor(emp).sheetName);
   }
 }
 
@@ -582,9 +695,14 @@ setInterval(async () => {
     if (store.noShowSent(id, today)) continue;      // already alerted
     store.markNoShow(id, today);
     const empObj = { id, ...info };
-    await notifyBoth(empObj,
-      `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start`);
-    appendRow([today, id, info.name, "No Show", fmtTime(now), `No check-in within ${graceMin} min of shift start`], companyFor(empObj).sheetName);
+    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start\n\n💬 Reply to this message with /notes <reason> to explain.`;
+    const sheetName = companyFor(empObj).sheetName;
+    const flagIds = await notifyBothFlagged(empObj, nsText, "no_show", today);
+    const rowNum = await appendRow(buildSheetRow({
+      ts: now, emp: empObj, rule, workDate: today, action: "No Show",
+      status: "No Show", notes: `No check-in within ${graceMin} min of shift start`, didntCome: true,
+    }), sheetName);
+    if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
   }
 }, 60 * 1000);
 
@@ -888,5 +1006,5 @@ if (!TEST_MODE) {
 }
 
 if (TEST_MODE) {
-  module.exports = { handleAuthEvent, processEvent, store, runMaintenance };
+  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, handleNotesCommand };
 }
