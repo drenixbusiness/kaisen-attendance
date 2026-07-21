@@ -104,7 +104,7 @@ function buildSheetRow({ ts, emp, rule, workDate, action, lateMin, status, notes
     (lateMin === undefined || lateMin === null || lateMin === "") ? "" : lateMin,
     status || "",
     notes || "",
-    didntCome ? "Yes" : "",
+    didntCome ? "YES" : "No",
   ];
 }
 
@@ -430,8 +430,8 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
   const sheetName = companyFor(emp).sheetName;
   if (isLate) {
-    // Flaggable: reply to THIS message, tap Menu, pick /notes, then type the reason.
-    text += `\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
+    // Flaggable: the "📝 Add reason" inline button (added by notifyBothFlagged)
+    // is the way to explain — no extra hint text needed in the message body.
     const flagIds = await notifyBothFlagged(emp, text, "late_checkin", today);
     const rowNum = await appendRow(row, sheetName);
     if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
@@ -460,7 +460,7 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
   await notifyBoth(emp,
     `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
-  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out", notes: `Worked: ${worked}` }), companyFor(emp).sheetName);
+  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out" }), companyFor(emp).sheetName);
 }
 
 async function doBreakIn(emp, ts, devName, open) {
@@ -472,8 +472,8 @@ async function doBreakIn(emp, ts, devName, open) {
   const rule = SHIFT_RULES[emp.shiftKey];
   appendRow(buildSheetRow({
     ts, emp, rule, workDate: open.work_date, action: "Back from break",
-    status: over ? "Over limit" : "",
-    notes: over ? `${dur} min (over limit)` : `${dur} min`,
+    lateMin: over ? dur - cfg.BREAK_LIMIT_MIN : 0,
+    status: over ? "Late" : "On time",
   }), companyFor(emp).sheetName);
 }
 
@@ -483,7 +483,7 @@ async function doBreakOut(emp, ts, devName, workDate, note = "") {
   // sent. Everything is still tracked in events.log and Google Sheets.
   console.log(`[break out] ${emp.name} @ ${fmtTime(ts)} (${devName})${note ? " — " + note : ""}`);
   const rule = SHIFT_RULES[emp.shiftKey];
-  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Break started", notes: note }), companyFor(emp).sheetName);
+  appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Break started" }), companyFor(emp).sheetName);
 }
 
 async function handleAuthEvent(emp, ts, deviceIp, kind) {
@@ -646,7 +646,6 @@ async function runMaintenance(now = Date.now()) {
           `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
         appendRow(buildSheetRow({
           ts: b.out_ts, emp, rule, workDate: b.work_date, action: "Checked out",
-          notes: `Face ID exit, no return — auto checkout (worked ${worked})`,
         }), companyFor(emp).sheetName);
       }
       continue;
@@ -659,7 +658,6 @@ async function runMaintenance(now = Date.now()) {
       logEvent(`AUTO-VOID stale open break: ${emp.name} (out at ${fmtTime(b.out_ts)}, never returned)`);
       appendRow(buildSheetRow({
         ts: now, emp, rule, workDate: b.work_date, action: "Break voided",
-        status: "Voided", notes: "Never returned — voided automatically",
       }), companyFor(emp).sheetName);
       continue;
     }
@@ -667,12 +665,12 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
       const sheetName = companyFor(emp).sheetName;
       const flagIds = await notifyBothFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
         ts: now, emp, rule, workDate: b.work_date, action: "WARNING",
-        status: "Break over limit", notes: `Break ${dur} min — over limit`,
+        lateMin: dur - cfg.BREAK_LIMIT_MIN, status: "Late",
       }), sheetName);
       if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
     }
@@ -712,7 +710,6 @@ async function runMaintenance(now = Date.now()) {
       `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
     appendRow(buildSheetRow({
       ts: outTs, emp, rule, workDate: srow.work_date, action: "Checked out",
-      notes: note + ` (worked ${worked})`,
     }), companyFor(emp).sheetName);
   }
 }
@@ -738,12 +735,12 @@ setInterval(async () => {
     if (store.noShowSent(id, today)) continue;      // already alerted
     store.markNoShow(id, today);
     const empObj = { id, ...info };
-    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
+    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start`;
     const sheetName = companyFor(empObj).sheetName;
     const flagIds = await notifyBothFlagged(empObj, nsText, "no_show", today);
     const rowNum = await appendRow(buildSheetRow({
       ts: now, emp: empObj, rule, workDate: today, action: "No Show",
-      status: "No Show", notes: `No check-in within ${graceMin} min of shift start`, didntCome: true,
+      status: "No Show", didntCome: true,
     }), sheetName);
     if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
   }
@@ -1015,15 +1012,25 @@ if (!TEST_MODE) {
     .then((me) => console.log(`Telegram token OK ✅ — bot @${me.username}`))
     .catch((e) => console.error(`TELEGRAM TOKEN ERROR ❌ — ${e.message} (check TELEGRAM_BOT_TOKEN in .env)`));
   // Registers the bot's commands so Telegram shows the native "Menu" button
-  // next to the message input (private chats): tapping it lists /start,
-  // /stop, /notes, /health — tapping one inserts it, no typing needed. This
-  // is what makes "reply, then pick /notes from the menu" possible.
-  bot.telegram.setMyCommands([
+  // next to the message input — but ONLY in PRIVATE chats with the bot.
+  // Commands must never appear in the company GROUP: employees use /notes,
+  // /start, /stop, /health one-on-one with the bot, not in the shared group.
+  // Every other scope (default, all group chats, group admins) is explicitly
+  // cleared to an EMPTY list so the Menu button shows nothing there — Telegram
+  // checks group-admin scope before falling back, so admins in the group
+  // would otherwise still see the menu even with only all_private_chats set.
+  const botCommands = [
     { command: "start", description: "Register to receive your attendance notifications" },
     { command: "notes", description: "Reply to a Late / No Show / Break-warning message to explain it" },
     { command: "stop", description: "Unsubscribe from notifications" },
     { command: "health", description: "Check the bot's status" },
-  ]).then(() => console.log("Bot commands menu registered ✅"))
+  ];
+  Promise.all([
+    bot.telegram.setMyCommands(botCommands, { scope: { type: "all_private_chats" } }),
+    bot.telegram.setMyCommands([], { scope: { type: "default" } }),
+    bot.telegram.setMyCommands([], { scope: { type: "all_group_chats" } }),
+    bot.telegram.setMyCommands([], { scope: { type: "all_chat_administrators" } }),
+  ]).then(() => console.log("Bot commands menu registered ✅ (private chats only — hidden in groups)"))
     .catch((e) => console.error("Failed to register commands menu:", e.message));
   // Verify the group WITHOUT sending a message
   bot.telegram.getChat(cfg.GROUP_CHAT_ID)

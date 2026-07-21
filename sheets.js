@@ -32,7 +32,7 @@ async function tryAppend(row, sheetName) {
   const res = await sheets.spreadsheets.values.append({
     spreadsheetId: cfg.SHEET.id,
     range: `${sheetName || cfg.SHEET.name}!A:J`,
-    valueInputOption: "USER_ENTERED",
+    valueInputOption: "RAW", // never let Sheets auto-reparse/reformat our date-time strings per locale
     requestBody: { values: [row] },
   });
   return rowNumberFromResponse(res);
@@ -68,7 +68,7 @@ async function updateNoteCell(sheetName, row, text) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: cfg.SHEET.id,
       range: `${sheetName || cfg.SHEET.name}!I${row}:I${row}`,
-      valueInputOption: "USER_ENTERED",
+      valueInputOption: "RAW",
       requestBody: { values: [[text]] },
     });
   } catch (e) {
