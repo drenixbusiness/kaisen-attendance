@@ -140,6 +140,10 @@ module.exports = {
     const r = db.prepare("SELECT notes FROM flagged_events WHERE id=?").get(Number(flagId));
     return r && r.notes ? r.notes : null;
   },
+  setFlagMessageId: (flagId, messageId) =>
+    db.prepare("UPDATE flagged_events SET message_id=? WHERE id=?").run(Number(messageId), Number(flagId)),
+  getFlag: (flagId) =>
+    db.prepare("SELECT * FROM flagged_events WHERE id=?").get(Number(flagId)),
   findFlagByReply: (chatId, messageId) =>
     db.prepare("SELECT * FROM flagged_events WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1")
       .get(String(chatId), Number(messageId)),

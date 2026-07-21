@@ -22,7 +22,7 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const { Telegraf } = require("telegraf");
+const { Telegraf, Markup } = require("telegraf");
 
 const cfg = require("./config");
 const SHIFT_RULES = require("./shifts");
@@ -146,9 +146,9 @@ function logEvent(line) {
 const bot = new Telegraf(cfg.BOT_TOKEN || "test-token");
 if (TEST_MODE) {
   global.__msgSeq = global.__msgSeq || 1000;
-  bot.telegram.sendMessage = async (chat, text) => {
+  bot.telegram.sendMessage = async (chat, text, extra = {}) => {
     const message_id = ++global.__msgSeq;
-    (global.__SENT = global.__SENT || []).push({ chat: String(chat), text, message_id });
+    (global.__SENT = global.__SENT || []).push({ chat: String(chat), text, message_id, reply_markup: extra.reply_markup });
     return { message_id, chat: { id: chat } };
   };
 }
@@ -156,11 +156,11 @@ if (TEST_MODE) {
 // Send with retry: transient network/DNS failures (EAI_AGAIN, timeouts,
 // resets) must never lose a check-in/checkout message. Permanent errors
 // (chat not found, bot blocked) are reported once without retrying.
-async function tgSend(chatId, text, tag) {
+async function tgSend(chatId, text, tag, extra = {}) {
   const MAX = 6;
   for (let a = 1; a <= MAX; a++) {
     try {
-      return await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
+      return await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML", ...extra });
     } catch (e) {
       const msg = String(e.message || "");
       const permanent = /chat not found|bot was blocked|user is deactivated|bot was kicked|not enough rights|400: Bad Request/i.test(msg);
@@ -207,23 +207,69 @@ async function notifyBoth(emp, text) {
 }
 
 // Like notifyBoth, but for the THREE "flaggable" event types the employee can
-// explain via /notes (late check-in, No Show, break warning): captures the
-// DM message_id(s) so a later reply can be matched back to this exact event.
+// explain (late check-in, No Show, break warning). Each DM gets its own
+// inline "📝 Add reason" button so the employee never has to type /notes —
+// tapping it opens Telegram's reply box already focused (force_reply), they
+// just type the reason and hit send. The old /notes-as-a-reply command still
+// works too (kept as a fallback), which is why the flag's message_id is
+// still recorded.
 async function notifyBothFlagged(emp, text, eventType, workDate) {
   const co = companyFor(emp);
   console.log(`[notify DM+group ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
-  const [dmResults] = await Promise.all([
-    Promise.all(chatIdsFor(emp.id).map(async (chatId) => {
-      const msg = await tgSend(chatId, text, "Failed to DM");
-      return msg && msg.message_id ? { chatId, messageId: msg.message_id } : null;
+  const chatIds = chatIdsFor(emp.id);
+  const flagIds = chatIds.map((chatId) => store.createFlag(emp.id, workDate, eventType, chatId, 0, co.sheetName));
+  await Promise.all([
+    Promise.all(chatIds.map(async (chatId, i) => {
+      const kb = Markup.inlineKeyboard([[Markup.button.callback("📝 Add reason", `note:${flagIds[i]}`)]]);
+      const msg = await tgSend(chatId, text, "Failed to DM", kb);
+      if (msg && msg.message_id) store.setFlagMessageId(flagIds[i], msg.message_id);
     })),
     sendToGroup(text, co.groupChatId),
   ]);
-  const flagIds = [];
-  for (const r of dmResults) {
-    if (r) flagIds.push(store.createFlag(emp.id, workDate, eventType, r.chatId, r.messageId, co.sheetName));
-  }
   return flagIds;
+}
+
+// In-memory: chatId -> flagId, set the moment the employee taps "📝 Add
+// reason". The NEXT plain-text message from that chat is captured as the
+// note (no /notes needed) and the state is cleared either way.
+const noteState = new Map();
+
+async function saveNoteForFlag(flagId, noteText) {
+  const tag = fmtTime(Date.now());
+  const merged = store.appendFlagNote(flagId, noteText, tag);
+  const flag = store.getFlag(flagId);
+  if (flag && flag.sheet_row) {
+    await updateNoteCell(flag.sheet_name, flag.sheet_row, merged).catch(() => {});
+  } // if the row isn't known yet, linkSheetRow() will push it once it is
+  return merged;
+}
+
+// Handles a tap on the "📝 Add reason" inline button.
+async function handleNoteButtonPress(ctx) {
+  const flagId = Number(ctx.match[1]);
+  await ctx.answerCbQuery();
+  noteState.set(String(ctx.chat.id), flagId);
+  return ctx.reply("✍️ Please type your reason:", Markup.forceReply().placeholder("Type your reason..."));
+}
+bot.action(/^note:(\d+)$/, handleNoteButtonPress);
+
+// Called at the top of the text handler: if this chat is waiting for a note
+// (button was tapped), the incoming text IS the reason — capture it and
+// return true so the caller doesn't fall through to /start's registration
+// flow. Returns false for every other message.
+async function handleNoteTextReply(ctx) {
+  const chatId = String(ctx.chat.id);
+  if (!noteState.has(chatId)) return false;
+  const flagId = noteState.get(chatId);
+  noteState.delete(chatId);
+  const noteText = (ctx.message.text || "").trim();
+  if (!noteText) {
+    await ctx.reply("ℹ️ Empty message — reason not saved. Tap \"📝 Add reason\" again if you'd like to add one.");
+    return true;
+  }
+  await saveNoteForFlag(flagId, noteText);
+  await ctx.reply("✅ Your note has been saved.");
+  return true;
 }
 
 // Once a flagged event's Sheets row number becomes known (immediately, or
@@ -314,16 +360,13 @@ async function handleNotesCommand(ctx) {
   if (!noteText) {
     return ctx.reply("ℹ️ Please write your reason after the command, e.g.: /notes bus was late");
   }
-  const tag = fmtTime(Date.now());
-  const merged = store.appendFlagNote(flag.id, noteText, tag);
-  if (flag.sheet_row) {
-    await updateNoteCell(flag.sheet_name, flag.sheet_row, merged).catch(() => {});
-  } // if the row isn't known yet (Sheets was briefly down), linkSheetRow() will push it once it is
+  await saveNoteForFlag(flag.id, noteText);
   return ctx.reply("✅ Your note has been saved.");
 }
 bot.command("notes", handleNotesCommand);
 
-bot.on("text", (ctx) => {
+bot.on("text", async (ctx) => {
+  if (await handleNoteTextReply(ctx)) return; // "📝 Add reason" flow took this message
   const st = regState.get(ctx.chat.id);
   if (!st) return;
   const input = ctx.message.text.trim();
@@ -387,8 +430,8 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
   const sheetName = companyFor(emp).sheetName;
   if (isLate) {
-    // Flaggable: the employee can reply to THIS message with /notes to explain.
-    text += `\n\n💬 Reply to this message with /notes <reason> to explain why you were late.`;
+    // Flaggable: reply to THIS message, tap Menu, pick /notes, then type the reason.
+    text += `\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
     const flagIds = await notifyBothFlagged(emp, text, "late_checkin", today);
     const rowNum = await appendRow(row, sheetName);
     if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
@@ -624,7 +667,7 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}\n\n💬 Reply to this message with /notes <reason> to explain.`;
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
       const sheetName = companyFor(emp).sheetName;
       const flagIds = await notifyBothFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
@@ -695,7 +738,7 @@ setInterval(async () => {
     if (store.noShowSent(id, today)) continue;      // already alerted
     store.markNoShow(id, today);
     const empObj = { id, ...info };
-    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start\n\n💬 Reply to this message with /notes <reason> to explain.`;
+    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start\n\n💬 To explain: reply to this message, tap Menu, choose /notes, then type your reason.`;
     const sheetName = companyFor(empObj).sheetName;
     const flagIds = await notifyBothFlagged(empObj, nsText, "no_show", today);
     const rowNum = await appendRow(buildSheetRow({
@@ -971,6 +1014,17 @@ if (!TEST_MODE) {
   bot.telegram.getMe()
     .then((me) => console.log(`Telegram token OK ✅ — bot @${me.username}`))
     .catch((e) => console.error(`TELEGRAM TOKEN ERROR ❌ — ${e.message} (check TELEGRAM_BOT_TOKEN in .env)`));
+  // Registers the bot's commands so Telegram shows the native "Menu" button
+  // next to the message input (private chats): tapping it lists /start,
+  // /stop, /notes, /health — tapping one inserts it, no typing needed. This
+  // is what makes "reply, then pick /notes from the menu" possible.
+  bot.telegram.setMyCommands([
+    { command: "start", description: "Register to receive your attendance notifications" },
+    { command: "notes", description: "Reply to a Late / No Show / Break-warning message to explain it" },
+    { command: "stop", description: "Unsubscribe from notifications" },
+    { command: "health", description: "Check the bot's status" },
+  ]).then(() => console.log("Bot commands menu registered ✅"))
+    .catch((e) => console.error("Failed to register commands menu:", e.message));
   // Verify the group WITHOUT sending a message
   bot.telegram.getChat(cfg.GROUP_CHAT_ID)
     .then((c) => console.log(`Group OK ✅ — "${c.title || c.id}" (${cfg.GROUP_CHAT_ID})`))
@@ -1006,5 +1060,5 @@ if (!TEST_MODE) {
 }
 
 if (TEST_MODE) {
-  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, handleNotesCommand };
+  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, handleNotesCommand, handleNoteButtonPress, handleNoteTextReply };
 }
