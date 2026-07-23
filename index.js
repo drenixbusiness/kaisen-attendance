@@ -229,6 +229,22 @@ async function notifyBothFlagged(emp, text, eventType, workDate) {
   return flagIds;
 }
 
+// Same as notifyBothFlagged, but DM-only — no group message at all. Used for
+// break warnings so they don't spam the company group; check-in, check-out,
+// and No Show alerts still go to both (unchanged).
+async function notifyDMFlagged(emp, text, eventType, workDate) {
+  const co = companyFor(emp);
+  console.log(`[notify DM-only ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
+  const chatIds = chatIdsFor(emp.id);
+  const flagIds = chatIds.map((chatId) => store.createFlag(emp.id, workDate, eventType, chatId, 0, co.sheetName));
+  await Promise.all(chatIds.map(async (chatId, i) => {
+    const kb = Markup.inlineKeyboard([[Markup.button.callback("📝 Add reason", `note:${flagIds[i]}`)]]);
+    const msg = await tgSend(chatId, text, "Failed to DM", kb);
+    if (msg && msg.message_id) store.setFlagMessageId(flagIds[i], msg.message_id);
+  }));
+  return flagIds;
+}
+
 // In-memory: chatId -> flagId, set the moment the employee taps "📝 Add
 // reason". The NEXT plain-text message from that chat is captured as the
 // note (no /notes needed) and the state is cleared either way.
@@ -667,7 +683,7 @@ async function runMaintenance(now = Date.now()) {
       const dur = Math.round((now - b.out_ts) / 60000);
       const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
       const sheetName = companyFor(emp).sheetName;
-      const flagIds = await notifyBothFlagged(emp, warnText, "break_warning", b.work_date);
+      const flagIds = await notifyDMFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
         ts: now, emp, rule, workDate: b.work_date, action: "WARNING",
         lateMin: dur - cfg.BREAK_LIMIT_MIN, status: "Late",
