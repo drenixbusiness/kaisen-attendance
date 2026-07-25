@@ -50,8 +50,11 @@ module.exports = {
     key: (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
   },
 
-  // Days when No Show alerts are NOT sent (0=Sunday, 1=Monday ... 6=Saturday)
-  NO_SHOW_OFF_DAYS: [0],
+  // Days when No Show alerts are NOT sent (0=Sunday, 1=Monday ... 6=Saturday).
+  // Configurable per company via .env, e.g. NO_SHOW_OFF_DAYS=0,6 for a
+  // Sat+Sun weekend. Defaults to Sunday only if not set.
+  NO_SHOW_OFF_DAYS: (process.env.NO_SHOW_OFF_DAYS || "0")
+    .split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n)),
 
   BREAK_LIMIT_MIN: 30,          // break limit (minutes)
   FACE_EXIT_CHECKOUT_MIN: 30,   // After the shift ends: a Face ID exit with no

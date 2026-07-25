@@ -735,9 +735,8 @@ if (!TEST_MODE) runMaintenance().catch(() => {}); // clean stale state at startu
 
 // No-Show watchdog — if no check-in within (120 + lateAllowableMin) minutes
 // of shift start, alert the employee DM + the group ONCE per shift date.
-setInterval(async () => {
-  const now = Date.now();
-  if (cfg.NO_SHOW_OFF_DAYS.includes(localDayOfWeek(now))) return; // day off (e.g. Sunday) — no No Show alerts
+async function runNoShowCheck(now = Date.now()) {
+  if (cfg.NO_SHOW_OFF_DAYS.includes(localDayOfWeek(now))) return; // day off (e.g. Sat/Sun) — no No Show alerts
   const today = fmtDate(now);
   const m = localMinutes(now);
   for (const [id, info] of Object.entries(EMPLOYEES)) {
@@ -760,7 +759,8 @@ setInterval(async () => {
     }), sheetName);
     if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
   }
-}, 60 * 1000);
+}
+if (!TEST_MODE) setInterval(() => runNoShowCheck().catch((e) => console.error("no-show check error:", e.message)), 60 * 1000);
 
 // ============================= EVENT PROCESSING =============================
 
@@ -1083,5 +1083,5 @@ if (!TEST_MODE) {
 }
 
 if (TEST_MODE) {
-  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, handleNotesCommand, handleNoteButtonPress, handleNoteTextReply };
+  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, runNoShowCheck, handleNotesCommand, handleNoteButtonPress, handleNoteTextReply };
 }
