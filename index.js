@@ -80,9 +80,14 @@ function fmtTime(ts) {
   }).format(new Date(ts));
 }
 
+// "Business day" boundary — which calendar date a record/shift is filed
+// under (workDate/"today"), and Sheets "Shift Date". Anchored to
+// cfg.DISPLAY_TZ (the company's operating calendar, e.g. Central America),
+// NOT the device's physical timezone — so midnight in Tashkent does NOT
+// roll the day over; it rolls over at DISPLAY_TZ's own midnight instead.
 function fmtDate(ts) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: cfg.TZ, year: "numeric", month: "2-digit", day: "2-digit",
+    timeZone: cfg.DISPLAY_TZ, year: "numeric", month: "2-digit", day: "2-digit",
   }).format(new Date(ts)); // YYYY-MM-DD
 }
 
@@ -90,16 +95,59 @@ function fmtDateTime(ts) {
   return `${fmtDate(ts)} ${fmtTime(ts)}`;
 }
 
+// ===== DISPLAY-ONLY formatting (cfg.DISPLAY_TZ) =====
+// Used ONLY for what a human reads (Telegram message text, the Sheets "Time
+// Local"/"Shift Time" columns). Never used for business logic — shift-window
+// matching, late/no-show grace periods, and the workDate ("today") a record
+// is filed under all continue to use fmtTime/fmtDate/localMinutes above,
+// which stay on cfg.TZ (the devices' real operational timezone).
+function fmtTimeDisplay(ts) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: cfg.DISPLAY_TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).format(new Date(ts));
+}
+
+function fmtDateDisplay(ts) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: cfg.DISPLAY_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(ts));
+}
+
+function fmtDateTimeDisplay(ts) {
+  return `${fmtDateDisplay(ts)} ${fmtTimeDisplay(ts)}`;
+}
+
+// Gets a timezone's current UTC offset in minutes (e.g. Tashkent -> +300).
+function tzOffsetMinutes(tz, atMs = Date.now()) {
+  const part = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
+    .formatToParts(new Date(atMs)).find((p) => p.type === "timeZoneName").value; // e.g. "GMT+5"
+  const m = part.match(/GMT([+-])(\d+)(?::(\d+))?/);
+  if (!m) return 0;
+  const sign = m[1] === "-" ? -1 : 1;
+  return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || "0", 10));
+}
+
+// Converts a plain "HH:MM" shift-label (defined in OPERATIONAL/cfg.TZ clock
+// time) into the equivalent clock reading in cfg.DISPLAY_TZ — so the "Shift
+// Time" column always matches "Time Local" in the same report, instead of
+// showing a confusing mix of two timezones.
+function convertHHMMForDisplay(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const diff = tzOffsetMinutes(cfg.DISPLAY_TZ) - tzOffsetMinutes(cfg.TZ);
+  const total = (((h * 60 + m + diff) % 1440) + 1440) % 1440;
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
 // Builds one Google Sheets row in the fixed 10-column order:
 // Time Local | Employee id | Employee Name | Action | Shift Time |
 // Shift Date | Late Minutes | Status | Notes | Didn't Come
 function buildSheetRow({ ts, emp, rule, workDate, action, lateMin, status, notes, didntCome }) {
   return [
-    fmtDateTime(ts),
+    fmtDateTimeDisplay(ts),
     emp.id,
     emp.name,
     action,
-    rule ? `${rule.workStart} - ${rule.workEnd}` : "",
+    rule ? `${convertHHMMForDisplay(rule.workStart)} - ${convertHHMMForDisplay(rule.workEnd)}` : "",
     workDate,
     (lateMin === undefined || lateMin === null || lateMin === "") ? "" : lateMin,
     status || "",
@@ -117,9 +165,21 @@ function localMinutes(ts) {
 
 const toMin = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
 
-// Day of week in the configured timezone: 0=Sunday ... 6=Saturday
+// The REAL operational (device-physical, cfg.TZ) calendar date of an
+// instant — needed wherever we must reconstruct a Tashkent-clock deadline
+// (like the daily auto-checkout below). NOT the same as fmtDate()'s
+// business-day key, which is now anchored to cfg.DISPLAY_TZ instead.
+function tashkentDateOf(ts) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: cfg.TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(ts));
+}
+
+// Day of week, anchored to cfg.DISPLAY_TZ (same business-day boundary as
+// fmtDate above) — so No-Show weekend/off-day checks match the company's
+// own calendar, not the device's physical timezone.
 function localDayOfWeek(ts) {
-  const name = new Intl.DateTimeFormat("en-US", { timeZone: cfg.TZ, weekday: "short" }).format(new Date(ts));
+  const name = new Intl.DateTimeFormat("en-US", { timeZone: cfg.DISPLAY_TZ, weekday: "short" }).format(new Date(ts));
   return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(name);
 }
 
@@ -251,7 +311,7 @@ async function notifyDMFlagged(emp, text, eventType, workDate) {
 const noteState = new Map();
 
 async function saveNoteForFlag(flagId, noteText) {
-  const tag = fmtTime(Date.now());
+  const tag = fmtTimeDisplay(Date.now());
   const merged = store.appendFlagNote(flagId, noteText, tag);
   const flag = store.getFlag(flagId);
   if (flag && flag.sheet_row) {
@@ -442,7 +502,7 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const diff = m - toMin(rule.workStart);
   const isLate = diff > rule.lateAllowableMin; // covers both "Late" and "Very late — No Show"
   const lateMin = isLate ? diff : 0;
-  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`;
+  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTimeDisplay(ts)}\n${st.text}\n📟 ${devName}`;
   const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
   const sheetName = companyFor(emp).sheetName;
   if (isLate) {
@@ -475,7 +535,7 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   const workedMin = Math.round((ts - rec.arrival) / 60000);
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
   await notifyBoth(emp,
-    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
+    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTimeDisplay(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
   appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out" }), companyFor(emp).sheetName);
 }
 
@@ -561,25 +621,22 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
   //    employee may still go to the store with Face ID before finally leaving
   //    with a fingerprint — those Face ID exits/returns are breaks.
   if (kind !== "face" && m >= toMin(rule.validCheckOutFrom) && m <= toMin(rule.validCheckOutTo)) {
-    const workDate = addDays(today, -rule.checkOutDayOffset);
-    const rec = store.getAttendance(emp.id, workDate);
-    if (rec && rec.arrival && !rec.departure) {
+    // Look up the open session directly rather than computing its workDate
+    // via checkOutDayOffset arithmetic — a shift's check-in and check-out
+    // can now land on the SAME business day (see fmtDate's CA-anchored
+    // boundary), so a fixed day offset is no longer reliable here.
+    // activeSession() only ever returns OPEN sessions (departure IS NULL),
+    // so "already checked out" is handled by the fall-through logic below,
+    // not here.
+    const rec = store.activeSession(emp.id);
+    if (rec) {
       if (open) {
         store.endBreak(open.id, ts);
         logEvent(`AUTO-CLOSE open break for ${emp.name} at checkout`);
       }
-      return doCheckOut(emp, rule, ts, devName, workDate, rec);
+      return doCheckOut(emp, rule, ts, devName, rec.work_date, rec);
     }
-    if (rec && rec.departure) {
-      if (rec.departure > 0 && ts - rec.departure < 120 * 1000) {
-        return logEvent(`DEDUP inside ${kind}: ${emp.name} — door scan right after checkout`);
-      }
-      logEvent(`EXIT after checkout: ${emp.name} (${workDate})`);
-      console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — already checked out`);
-      appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Exited (after checkout)" }), companyFor(emp).sheetName);
-      return;
-    }
-    // no check-in for that shift date — fall through to the session logic
+    // no open session — fall through to the general session/exit logic below
   }
 
   const session = store.activeSession(emp.id);
@@ -613,8 +670,10 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
   }
   // Distinguish "exit after an already-completed checkout" (e.g. a Face ID
   // scan hours after checking out) from "exit with no check-in at all".
-  const coDate = addDays(today, -rule.checkOutDayOffset);
-  const coRec = store.getAttendance(emp.id, coDate);
+  // checkOutDayOffset no longer reliably maps here (a shift's check-in and
+  // check-out can land on the SAME business day now — see fmtDate), so check
+  // both today and the day before rather than doing signed date arithmetic.
+  const coRec = store.getAttendance(emp.id, addDays(today, -1));
   const doneRec = (coRec && coRec.departure) ? coRec : ((todayRec && todayRec.departure) ? todayRec : null);
   if (doneRec) {
     if (doneRec.departure > 0 && ts - doneRec.departure < 120 * 1000) {
@@ -659,7 +718,7 @@ async function runMaintenance(now = Date.now()) {
         const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
         logEvent(`FACE-EXIT->CHECKOUT: ${emp.name} left at ${fmtTime(b.out_ts)} with Face ID and did not return`);
         await notifyBoth(emp,
-          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
+          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTimeDisplay(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
         appendRow(buildSheetRow({
           ts: b.out_ts, emp, rule, workDate: b.work_date, action: "Checked out",
         }), companyFor(emp).sheetName);
@@ -681,7 +740,7 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTimeDisplay(b.out_ts)}`;
       const sheetName = companyFor(emp).sheetName;
       const flagIds = await notifyDMFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
@@ -704,7 +763,15 @@ async function runMaintenance(now = Date.now()) {
     const emp = findEmployee(srow.emp_id, true);
     const rule = emp && SHIFT_RULES[emp.shiftKey];
     if (!rule) continue;
-    const deadline = Date.parse(`${addDays(srow.work_date, rule.checkOutDayOffset)}T${rule.validCheckOutTo}:00+05:00`);
+    // IMPORTANT: srow.work_date is the CA-anchored business-day key (may not
+    // equal the REAL Tashkent calendar date the checkin physically happened
+    // on). The deadline/workEnd below are Tashkent-clock concepts, so they
+    // must be anchored to the REAL Tashkent date of the actual arrival scan,
+    // not the business-day label.
+    const arrivalTashkentDate = tashkentDateOf(srow.arrival);
+    const offMin = tzOffsetMinutes(cfg.TZ);
+    const offStr = `${offMin >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(offMin) / 60)).padStart(2, "0")}:${String(Math.abs(offMin) % 60).padStart(2, "0")}`;
+    const deadline = Date.parse(`${addDays(arrivalTashkentDate, rule.checkOutDayOffset)}T${rule.validCheckOutTo}:00${offStr}`);
     if (!Number.isFinite(deadline) || now <= deadline) continue;
 
     const lastBrk = store.lastBreakOfSession(srow.emp_id, srow.work_date);
@@ -713,7 +780,7 @@ async function runMaintenance(now = Date.now()) {
     if (outTs) {
       note = "Auto checkout — left without a fingerprint checkout; time taken from the last exit scan.";
     } else {
-      outTs = Date.parse(`${addDays(srow.work_date, rule.checkOutDayOffset)}T${rule.workEnd}:00+05:00`);
+      outTs = Date.parse(`${addDays(arrivalTashkentDate, rule.checkOutDayOffset)}T${rule.workEnd}:00${offStr}`);
       note = "Auto checkout — no checkout scan was recorded; scheduled shift end used.";
     }
     if (!Number.isFinite(outTs) || outTs <= srow.arrival) outTs = Number(srow.arrival);
@@ -723,7 +790,7 @@ async function runMaintenance(now = Date.now()) {
     const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
     logEvent(`AUTO-CHECKOUT: ${emp.name} (${srow.work_date}) at ${fmtTime(outTs)} — ${note}`);
     await notifyBoth(emp,
-      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
+      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTimeDisplay(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
     appendRow(buildSheetRow({
       ts: outTs, emp, rule, workDate: srow.work_date, action: "Checked out",
     }), companyFor(emp).sheetName);
