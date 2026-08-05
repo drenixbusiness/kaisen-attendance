@@ -107,6 +107,19 @@ function tzOffsetMinutes(tz, atMs = Date.now()) {
   return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || "0", 10));
 }
 
+// Converts a plain "HH:MM" shift-label (defined in OPERATIONAL/cfg.TZ clock
+// time) into the equivalent clock reading in cfg.DISPLAY_TZ. Used ONLY for
+// the Sheets "Shift Time" column — the shift's hours expressed on the
+// company's own (Central America) business clock. Everything else (Time
+// Local, check-in/check-out message times) stays real Tashkent time,
+// unconverted — only this one label is shown in CA time.
+function convertHHMMForDisplay(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const diff = tzOffsetMinutes(cfg.DISPLAY_TZ) - tzOffsetMinutes(cfg.TZ);
+  const total = (((h * 60 + m + diff) % 1440) + 1440) % 1440;
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
 // Builds one Google Sheets row in the fixed 10-column order:
 // Time Local | Employee id | Employee Name | Action | Shift Time |
 // Shift Date | Late Minutes | Status | Notes | Didn't Come
@@ -116,7 +129,7 @@ function buildSheetRow({ ts, emp, rule, workDate, action, lateMin, status, notes
     emp.id,
     emp.name,
     action,
-    rule ? `${rule.workStart} - ${rule.workEnd}` : "",
+    rule ? `${convertHHMMForDisplay(rule.workStart)} - ${convertHHMMForDisplay(rule.workEnd)}` : "",
     workDate,
     (lateMin === undefined || lateMin === null || lateMin === "") ? "" : lateMin,
     status || "",
