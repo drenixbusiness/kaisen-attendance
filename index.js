@@ -95,29 +95,9 @@ function fmtDateTime(ts) {
   return `${fmtDate(ts)} ${fmtTime(ts)}`;
 }
 
-// ===== DISPLAY-ONLY formatting (cfg.DISPLAY_TZ) =====
-// Used ONLY for what a human reads (Telegram message text, the Sheets "Time
-// Local"/"Shift Time" columns). Never used for business logic — shift-window
-// matching, late/no-show grace periods, and the workDate ("today") a record
-// is filed under all continue to use fmtTime/fmtDate/localMinutes above,
-// which stay on cfg.TZ (the devices' real operational timezone).
-function fmtTimeDisplay(ts) {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: cfg.DISPLAY_TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-  }).format(new Date(ts));
-}
-
-function fmtDateDisplay(ts) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: cfg.DISPLAY_TZ, year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(new Date(ts));
-}
-
-function fmtDateTimeDisplay(ts) {
-  return `${fmtDateDisplay(ts)} ${fmtTimeDisplay(ts)}`;
-}
-
 // Gets a timezone's current UTC offset in minutes (e.g. Tashkent -> +300).
+// Used to reconstruct a correct operational (cfg.TZ) deadline instant in the
+// daily auto-checkout maintenance below, without hardcoding a fixed offset.
 function tzOffsetMinutes(tz, atMs = Date.now()) {
   const part = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
     .formatToParts(new Date(atMs)).find((p) => p.type === "timeZoneName").value; // e.g. "GMT+5"
@@ -127,27 +107,16 @@ function tzOffsetMinutes(tz, atMs = Date.now()) {
   return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || "0", 10));
 }
 
-// Converts a plain "HH:MM" shift-label (defined in OPERATIONAL/cfg.TZ clock
-// time) into the equivalent clock reading in cfg.DISPLAY_TZ — so the "Shift
-// Time" column always matches "Time Local" in the same report, instead of
-// showing a confusing mix of two timezones.
-function convertHHMMForDisplay(hhmm) {
-  const [h, m] = hhmm.split(":").map(Number);
-  const diff = tzOffsetMinutes(cfg.DISPLAY_TZ) - tzOffsetMinutes(cfg.TZ);
-  const total = (((h * 60 + m + diff) % 1440) + 1440) % 1440;
-  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
-}
-
 // Builds one Google Sheets row in the fixed 10-column order:
 // Time Local | Employee id | Employee Name | Action | Shift Time |
 // Shift Date | Late Minutes | Status | Notes | Didn't Come
 function buildSheetRow({ ts, emp, rule, workDate, action, lateMin, status, notes, didntCome }) {
   return [
-    fmtDateTimeDisplay(ts),
+    fmtDateTime(ts),
     emp.id,
     emp.name,
     action,
-    rule ? `${convertHHMMForDisplay(rule.workStart)} - ${convertHHMMForDisplay(rule.workEnd)}` : "",
+    rule ? `${rule.workStart} - ${rule.workEnd}` : "",
     workDate,
     (lateMin === undefined || lateMin === null || lateMin === "") ? "" : lateMin,
     status || "",
@@ -311,7 +280,7 @@ async function notifyDMFlagged(emp, text, eventType, workDate) {
 const noteState = new Map();
 
 async function saveNoteForFlag(flagId, noteText) {
-  const tag = fmtTimeDisplay(Date.now());
+  const tag = fmtTime(Date.now());
   const merged = store.appendFlagNote(flagId, noteText, tag);
   const flag = store.getFlag(flagId);
   if (flag && flag.sheet_row) {
@@ -502,7 +471,7 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const diff = m - toMin(rule.workStart);
   const isLate = diff > rule.lateAllowableMin; // covers both "Late" and "Very late — No Show"
   const lateMin = isLate ? diff : 0;
-  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTimeDisplay(ts)}\n${st.text}\n📟 ${devName}`;
+  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`;
   const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
   const sheetName = companyFor(emp).sheetName;
   if (isLate) {
@@ -535,7 +504,7 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   const workedMin = Math.round((ts - rec.arrival) / 60000);
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
   await notifyBoth(emp,
-    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTimeDisplay(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
+    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
   appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out" }), companyFor(emp).sheetName);
 }
 
@@ -718,7 +687,7 @@ async function runMaintenance(now = Date.now()) {
         const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
         logEvent(`FACE-EXIT->CHECKOUT: ${emp.name} left at ${fmtTime(b.out_ts)} with Face ID and did not return`);
         await notifyBoth(emp,
-          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTimeDisplay(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
+          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
         appendRow(buildSheetRow({
           ts: b.out_ts, emp, rule, workDate: b.work_date, action: "Checked out",
         }), companyFor(emp).sheetName);
@@ -740,7 +709,7 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTimeDisplay(b.out_ts)}`;
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
       const sheetName = companyFor(emp).sheetName;
       const flagIds = await notifyDMFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
@@ -790,7 +759,7 @@ async function runMaintenance(now = Date.now()) {
     const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
     logEvent(`AUTO-CHECKOUT: ${emp.name} (${srow.work_date}) at ${fmtTime(outTs)} — ${note}`);
     await notifyBoth(emp,
-      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTimeDisplay(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
+      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
     appendRow(buildSheetRow({
       ts: outTs, emp, rule, workDate: srow.work_date, action: "Checked out",
     }), companyFor(emp).sheetName);

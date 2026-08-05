@@ -66,5 +66,20 @@ module.exports = {
   FP_CODES: [38, 76],           // fingerprint authentication passed
   FACE_CODES: [75, 1, 21],      // face authentication passed
 
+  // TZ = OPERATIONAL/device timezone — where the Hikvision devices and
+  // employees physically are. Drives ONLY the time-of-day clock comparisons
+  // (shift-window matching, late/no-show grace periods) and the raw
+  // Tashkent-clock display shown in messages/Sheets ("Time Local", 🕐 lines).
+  // Do NOT change this unless the devices themselves move.
   TZ: "Asia/Tashkent",
+
+  // DISPLAY_TZ = BUSINESS-DAY timezone — which calendar date a shift/record
+  // is filed under ("Shift Date", the workDate/"today" key, and the No-Show
+  // weekend check). It does NOT affect the displayed clock TIME (that always
+  // stays real Tashkent time) — only which DAY an event belongs to, so an
+  // event just after Tashkent midnight isn't wrongly bucketed into a new
+  // business day while it's still the previous day here. "America/Chicago"
+  // is real US Central Time (auto-adjusts CDT/CST with DST) — override per
+  // company via .env if a different reporting timezone is needed.
+  DISPLAY_TZ: process.env.DISPLAY_TZ || "America/Chicago",
 };
