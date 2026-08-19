@@ -74,6 +74,15 @@ function findEmployee(rawId, exact = false) {
   return null;
 }
 
+// Escapes text that gets interpolated into an HTML-parse_mode Telegram
+// message (employee names, etc.) — an unescaped "&", "<", ">" in a name
+// breaks Telegram's HTML parser (400 Bad Request), which without this fix
+// could silently drop a check-in/check-out notification.
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function fmtTime(ts) {
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: cfg.TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
@@ -195,17 +204,40 @@ if (TEST_MODE) {
   };
 }
 
+// Per-chat send queue: sends to the SAME chat are lightly spaced out so a
+// burst of check-ins (several employees arriving within the same second)
+// can never self-trigger Telegram's rate limit on that chat. Sends to
+// DIFFERENT chats (other employees' DMs, other companies' groups) stay
+// fully independent/parallel — this only serializes same-chat traffic.
+const sendQueues = new Map();
+function queuedSend(chatId, fn) {
+  const key = String(chatId);
+  const prev = sendQueues.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn).finally(() => new Promise((r) => setTimeout(r, 250)));
+  sendQueues.set(key, next);
+  return next;
+}
+
 // Send with retry: transient network/DNS failures (EAI_AGAIN, timeouts,
-// resets) must never lose a check-in/checkout message. Permanent errors
-// (chat not found, bot blocked) are reported once without retrying.
+// resets, rate limits) must NEVER lose a check-in/checkout message — every
+// message is retried until it succeeds. Only a small, specific set of
+// TRULY unrecoverable errors (the chat/user genuinely doesn't exist or
+// blocked the bot) skip retrying, since retrying those can never succeed.
+// A generic "400: Bad Request" (e.g. a transient parse hiccup) is NOT
+// treated as permanent — it still gets retried, so a message is never
+// silently dropped just because one attempt hit an unusual error.
 async function tgSend(chatId, text, tag, extra = {}) {
-  const MAX = 6;
+  return queuedSend(chatId, () => tgSendOnce(chatId, text, tag, extra));
+}
+
+async function tgSendOnce(chatId, text, tag, extra) {
+  const MAX = 8;
   for (let a = 1; a <= MAX; a++) {
     try {
       return await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML", ...extra });
     } catch (e) {
       const msg = String(e.message || "");
-      const permanent = /chat not found|bot was blocked|user is deactivated|bot was kicked|not enough rights|400: Bad Request/i.test(msg);
+      const permanent = /chat not found|bot was blocked|user is deactivated|bot was kicked|not enough rights/i.test(msg);
       if (permanent || a === MAX) {
         console.error(`${tag} ${chatId}: ${msg}`);
         if (/chat not found/i.test(msg)) {
@@ -213,8 +245,11 @@ async function tgSend(chatId, text, tag, extra = {}) {
         }
         return null;
       }
-      // transient (DNS EAI_AGAIN, ETIMEDOUT, ECONNRESET, 5xx, 429...) — wait & retry
-      await new Promise((r) => setTimeout(r, Math.min(10000 * a, 45000)));
+      // Transient (DNS EAI_AGAIN, ETIMEDOUT, ECONNRESET, 5xx, 429, stray
+      // 400s...) — retry fast: most blips clear within 1-2s, so the very
+      // first retry already lands well under a second after the original
+      // attempt. Backoff grows only if the problem persists.
+      await new Promise((r) => setTimeout(r, Math.min(300 * 2 ** (a - 1), 20000)));
     }
   }
   return null;
@@ -355,7 +390,7 @@ bot.start((ctx) => {
   if (existingEmpId) {
     const emp = findEmployee(existingEmpId, true) || { id: existingEmpId, name: `Employee #${existingEmpId}` };
     return ctx.reply(
-      `✅ You are already registered as <b>${emp.name}</b> (${companyFor(emp).label}).\nYour check-in/check-out notifications will keep arriving here.\nSend /stop if you want to disconnect.`,
+      `✅ You are already registered as <b>${escapeHtml(emp.name)}</b> (${escapeHtml(companyFor(emp).label)}).\nYour check-in/check-out notifications will keep arriving here.\nSend /stop if you want to disconnect.`,
       { parse_mode: "HTML" }
     );
   }
@@ -458,7 +493,7 @@ bot.on("text", async (ctx) => {
     regState.delete(ctx.chat.id);
     store.subscribe(ctx.chat.id, emp.id);
     return ctx.reply(
-      `✅ Connected: <b>${emp.name}</b> — ${companyFor(emp).label} (${SHIFT_RULES[emp.shiftKey]?.label || emp.shiftKey})\nYour check-in/check-out notifications will arrive here.\nSend /stop to disconnect.`,
+      `✅ Connected: <b>${escapeHtml(emp.name)}</b> — ${escapeHtml(companyFor(emp).label)} (${escapeHtml(SHIFT_RULES[emp.shiftKey]?.label || emp.shiftKey)})\nYour check-in/check-out notifications will arrive here.\nSend /stop to disconnect.`,
       { parse_mode: "HTML" }
     );
   }
@@ -484,7 +519,7 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const diff = m - toMin(rule.workStart);
   const isLate = diff > rule.lateAllowableMin; // covers both "Late" and "Very late — No Show"
   const lateMin = isLate ? diff : 0;
-  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`;
+  let text = `🏢 <b>CHECKED IN</b>\n👤 Name: ${escapeHtml(emp.name)} (ID: ${emp.id})\n🏷 Shift: ${escapeHtml(rule.label)}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${escapeHtml(devName)}`;
   const row = buildSheetRow({ ts, emp, rule, workDate: today, action: "Checked in", lateMin, status: st.note });
   const sheetName = companyFor(emp).sheetName;
   if (isLate) {
@@ -517,7 +552,7 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   const workedMin = Math.round((ts - rec.arrival) / 60000);
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
   await notifyBoth(emp,
-    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
+    `🚪 <b>CHECKED OUT</b>\n👤 Name: ${escapeHtml(emp.name)} (ID: ${emp.id})\n🏷 Shift: ${escapeHtml(rule.label)}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${escapeHtml(devName)}`);
   appendRow(buildSheetRow({ ts, emp, rule, workDate, action: "Checked out" }), companyFor(emp).sheetName);
 }
 
@@ -700,7 +735,7 @@ async function runMaintenance(now = Date.now()) {
         const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
         logEvent(`FACE-EXIT->CHECKOUT: ${emp.name} left at ${fmtTime(b.out_ts)} with Face ID and did not return`);
         await notifyBoth(emp,
-          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
+          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${escapeHtml(emp.name)} (ID: ${emp.id})\n🏷 Shift: ${escapeHtml(rule.label)}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
         appendRow(buildSheetRow({
           ts: b.out_ts, emp, rule, workDate: b.work_date, action: "Checked out",
         }), companyFor(emp).sheetName);
@@ -722,7 +757,7 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      const warnText = `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
+      const warnText = `🔴 <b>WARNING!</b>\n👤 ${escapeHtml(emp.name)}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`;
       const sheetName = companyFor(emp).sheetName;
       const flagIds = await notifyDMFlagged(emp, warnText, "break_warning", b.work_date);
       const rowNum = await appendRow(buildSheetRow({
@@ -772,15 +807,35 @@ async function runMaintenance(now = Date.now()) {
     const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
     logEvent(`AUTO-CHECKOUT: ${emp.name} (${srow.work_date}) at ${fmtTime(outTs)} — ${note}`);
     await notifyBoth(emp,
-      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
+      `🚪 <b>CHECKED OUT</b>\n👤 Name: ${escapeHtml(emp.name)} (ID: ${emp.id})\n🏷 Shift: ${escapeHtml(rule.label)}\n📅 Shift Date: ${srow.work_date}\n🕐 ${fmtTime(outTs)}\n⏱ Worked: ${worked}\nℹ️ ${note}`);
     appendRow(buildSheetRow({
       ts: outTs, emp, rule, workDate: srow.work_date, action: "Checked out",
     }), companyFor(emp).sheetName);
   }
 }
 
-setInterval(() => runMaintenance().catch((e) => console.error("maintenance error:", e.message)), 60 * 1000);
-if (!TEST_MODE) runMaintenance().catch(() => {}); // clean stale state at startup too
+// Overlap guard: if Google Sheets is slow/retrying and a maintenance run
+// takes longer than 60s, the NEXT scheduled tick must NOT start a second,
+// overlapping run — otherwise the same stale session/break can be read by
+// both runs before either has written its result, and the employee gets
+// TWO "CHECKED OUT" (or two No-Show) messages for one real event. The
+// exported runMaintenance()/runNoShowCheck() themselves stay guard-free
+// (so tests can call them directly, back-to-back, predictably) — the guard
+// only wraps the production setInterval-triggered calls below.
+let maintenanceRunning = false;
+async function runMaintenanceGuarded(now) {
+  if (maintenanceRunning) {
+    return logEvent("Maintenance tick skipped — previous run still in progress (likely slow Sheets/network)");
+  }
+  maintenanceRunning = true;
+  try {
+    await runMaintenance(now);
+  } finally {
+    maintenanceRunning = false;
+  }
+}
+if (!TEST_MODE) setInterval(() => runMaintenanceGuarded().catch((e) => console.error("maintenance error:", e.message)), 60 * 1000);
+if (!TEST_MODE) runMaintenanceGuarded().catch(() => {}); // clean stale state at startup too
 
 // No-Show watchdog — if no check-in within (120 + lateAllowableMin) minutes
 // of shift start, alert the employee DM + the group ONCE per shift date.
@@ -799,7 +854,7 @@ async function runNoShowCheck(now = Date.now()) {
     if (store.noShowSent(id, today)) continue;      // already alerted
     store.markNoShow(id, today);
     const empObj = { id, ...info };
-    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start`;
+    const nsText = `🚫 <b>No Show Alert</b>\n👤 Name: ${escapeHtml(info.name)}\n🏷 Shift: ${escapeHtml(rule.label)}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start`;
     const sheetName = companyFor(empObj).sheetName;
     const flagIds = await notifyBothFlagged(empObj, nsText, "no_show", today);
     const rowNum = await appendRow(buildSheetRow({
@@ -809,7 +864,21 @@ async function runNoShowCheck(now = Date.now()) {
     if (flagIds[0]) linkSheetRow(flagIds[0], sheetName, rowNum);
   }
 }
-if (!TEST_MODE) setInterval(() => runNoShowCheck().catch((e) => console.error("no-show check error:", e.message)), 60 * 1000);
+// Same overlap guard as maintenance — prevents two concurrent runs from
+// both alerting No-Show for the same employee if a run takes >60s.
+let noShowRunning = false;
+async function runNoShowCheckGuarded(now) {
+  if (noShowRunning) {
+    return logEvent("No-Show check tick skipped — previous run still in progress");
+  }
+  noShowRunning = true;
+  try {
+    await runNoShowCheck(now);
+  } finally {
+    noShowRunning = false;
+  }
+}
+if (!TEST_MODE) setInterval(() => runNoShowCheckGuarded().catch((e) => console.error("no-show check error:", e.message)), 60 * 1000);
 
 // ============================= EVENT PROCESSING =============================
 
@@ -1132,5 +1201,5 @@ if (!TEST_MODE) {
 }
 
 if (TEST_MODE) {
-  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, runNoShowCheck, handleNotesCommand, handleNoteButtonPress, handleNoteTextReply };
+  module.exports = { handleAuthEvent, processEvent, store, runMaintenance, runNoShowCheck, runMaintenanceGuarded, runNoShowCheckGuarded, handleNotesCommand, handleNoteButtonPress, handleNoteTextReply };
 }
